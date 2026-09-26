@@ -1,0 +1,16 @@
+# Secrets
+.env
+.env.*
+
+# Virtual environment
+labenv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+
+# Generated vector DB (rebuilt by kb_setup.py)
+data/chroma_db/
