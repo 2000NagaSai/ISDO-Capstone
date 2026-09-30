@@ -9,15 +9,23 @@ C7: the HITL gate fires for any of three reasons (several can apply at once):
     2. Resolution Agent confidence is LOW (any priority)
     3. Access Grant request (request_type 'Access Grant') — any priority
 
+C8: when the local ChromaDB search gives LOW confidence, the Resolution node asks the
+A2A Knowledge Specialist (a2a/knowledge_specialist.py, port 8001) for a second opinion.
+If it returns MEDIUM/HIGH, its resolution and confidence replace the local ones (so the
+LOW-confidence HITL trigger no longer fires). If it is not running or fails, the ticket
+stays LOW and goes to the HITL gate.
+
 Reuses the agents from Labs C3-C5 (agents/triage_agent.py, resolution_agent.py, sla_agent.py).
 
 Run from the project root:
     python orchestrator/supervisor.py                 # all test tickets
     python orchestrator/supervisor.py INC0001002      # only the listed ticket(s)
 Needs: ANTHROPIC_API_KEY in .env, Lab C1 KB (data/chroma_db), snow_shim + jira_shim running (Lab C2).
+Optional (C8): the Knowledge Specialist on port 8001.
 """
 
 import operator
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +50,9 @@ client, MODEL = triage_agent.client, triage_agent.MODEL
 PRIORITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}
 JIRA_ISSUE_URL = "http://localhost:5002/rest/api/2/issue"
 ACCESS_GRANT = "access grant"
+A2A_URL = os.environ.get("ISDO_A2A_URL", "http://localhost:8001")   # Knowledge Specialist (C8)
+A2A_TIMEOUT = 90          # seconds — POST /tasks runs a Claude call before it answers
+CONFIDENCE_LEVELS = {"HIGH", "MEDIUM", "LOW"}
 
 # ── SHARED STATE ──────────────────────────────────────────────────────────────
 class TicketState(TypedDict, total=False):
@@ -68,6 +79,8 @@ class TicketState(TypedDict, total=False):
     escalation_required: bool
     hitl_required: bool
     hitl_reason: str           # C7: why the gate fired (reasons joined with " | ")
+    a2a_used: bool             # C8: resolution/confidence came from the Knowledge Specialist
+    a2a_status: str            # C8: not_needed / completed / unavailable / error: ...
     hitl_approved: bool
     # communication
     user_message: str
@@ -121,6 +134,28 @@ def update_jira_request(ticket_number, status, note):
     print(f"  [Jira Mock] {ticket_number} status -> {status}" + ("" if ok else "  FAILED"))
     return ok
 
+
+def call_knowledge_specialist(state):
+    """A2A call (Lab C8): POST /tasks -> task_id, then GET /tasks/{task_id} -> result.
+    Returns the task's 'result' dict. Raises requests exceptions / ValueError on any failure."""
+    payload = {
+        "query": f"{state['short_description']}. {state['description']}",
+        "ticket_number": state["ticket_number"],
+        "context": f"category={state.get('triage_category')}, priority={effective_priority(state)}",
+    }
+    print(f"  -> A2A: POST {A2A_URL}/tasks")
+    r = requests.post(f"{A2A_URL}/tasks", json=payload, timeout=A2A_TIMEOUT)
+    r.raise_for_status()
+    task_id = r.json()["task_id"]
+
+    print(f"  -> A2A: GET  {A2A_URL}/tasks/{task_id}")
+    r = requests.get(f"{A2A_URL}/tasks/{task_id}", timeout=A2A_TIMEOUT)
+    r.raise_for_status()
+    task = r.json()
+    if task.get("status") != "completed":
+        raise ValueError(f"task {task_id} status is {task.get('status')!r}, not 'completed'")
+    return task["result"]
+
 # ── NODES ─────────────────────────────────────────────────────────────────────
 def triage_node(state: TicketState) -> dict:
     print(f"\n▶ TRIAGE AGENT — {state['ticket_number']}")
@@ -144,15 +179,53 @@ def resolution_node(state: TicketState) -> dict:
     r = resolution_agent.resolve_ticket(
         state["ticket_number"], state["short_description"], state["description"],
         state.get("triage_category", state.get("category")), effective_priority(state))
-    return {
+    update = {
         "kb_article": r.get("kb_article_used", "none"),
         "resolution_text": r.get("resolution_text", ""),
         "auto_resolve": bool(r.get("auto_resolve")),
         "confidence": r.get("confidence", "LOW"),
+        "a2a_used": False,
+        "a2a_status": "not_needed",
         "audit_log": audit("ResolutionAgent", "search_kb",
                            f"{r.get('kb_article_used')} | {r.get('confidence')} ({r.get('score', 0):.0%}) | "
                            f"auto_resolve={r.get('auto_resolve')}"),
     }
+    if update["confidence"] != "LOW":
+        return update
+
+    # ── C8: LOW confidence -> ask the Knowledge Specialist over A2A ──
+    print("\n▶ A2A — LOW confidence, asking Knowledge Specialist")
+    try:
+        res = call_knowledge_specialist(state)
+    except requests.exceptions.ConnectionError:
+        print(f"  A2A server not reachable at {A2A_URL} — falling back to HITL")
+        update["a2a_status"] = "unavailable"
+        update["audit_log"] += audit("ResolutionAgent", "a2a_call", f"FAILED: {A2A_URL} not reachable -> HITL")
+        return update
+    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+        print(f"  A2A call failed ({e}) — falling back to HITL")
+        update["a2a_status"] = f"error: {type(e).__name__}"
+        update["audit_log"] += audit("ResolutionAgent", "a2a_call", f"FAILED: {e} -> HITL")
+        return update
+
+    conf = str(res.get("confidence", "LOW")).upper()
+    if conf not in CONFIDENCE_LEVELS or res.get("escalate_to_l2"):
+        conf = "LOW"               # unknown value or specialist says escalate -> treat as LOW
+    print(f"  A2A result: {res.get('best_match')} | {conf} ({res.get('confidence_score', 0):.0%}) | "
+          f"escalate_to_l2={res.get('escalate_to_l2')}")
+    update.update({
+        "a2a_used": True,
+        "a2a_status": "completed",
+        "confidence": conf,
+        "kb_article": f"{res.get('best_match', 'none')} (via A2A)",
+        "resolution_text": res.get("resolution") or update["resolution_text"],
+        # The specialist writes for L2 engineers, so its answer is never auto-sent to the user.
+        "auto_resolve": False,
+    })
+    update["audit_log"] += audit("ResolutionAgent", "a2a_call",
+                                 f"Knowledge Specialist: {res.get('best_match')} | {conf} "
+                                 f"({res.get('confidence_score', 0):.0%}) | escalate_to_l2={res.get('escalate_to_l2')}")
+    return update
 
 
 def sla_node(state: TicketState) -> dict:
@@ -172,8 +245,12 @@ def sla_node(state: TicketState) -> dict:
         reasons.append(f"{priority} SLA {s['breach_risk']} -- escalation to {escalation_team(state)} "
                        f"requires approval")
     if state.get("confidence", "LOW") == "LOW":
-        reasons.append(f"LOW KB confidence -- no reliable fix found (KB: {state.get('kb_article', 'none')}); "
-                       f"route to {escalation_team(state)} for L2 handling")
+        a2a = state.get("a2a_status", "not_needed")
+        a2a_note = ("Knowledge Specialist also LOW" if a2a == "completed"
+                    else f"Knowledge Specialist {a2a}" if a2a != "not_needed" else "")
+        reasons.append(f"LOW KB confidence -- no reliable fix found (KB: {state.get('kb_article', 'none')}"
+                       + (f"; {a2a_note}" if a2a_note else "")
+                       + f"); route to {escalation_team(state)} for L2 handling")
     if is_access_grant(state):
         reasons.append("ACCESS GRANT -- access request requires security approval")
     hitl_required = bool(reasons)
@@ -337,6 +414,14 @@ if __name__ == "__main__":
             "description": "Multiple users in Finance unable to login to SAP. Error code: DBCON_FAIL. "
                            "Started 09:00 today.",
             "category": "Application", "priority": "P1", "sla_due": "2024-01-15 10:40:00",
+        },
+        {   # C8 — no KB article covers BSOD -> LOW locally -> A2A Knowledge Specialist
+            #      (A2A running: its confidence is used; A2A down: falls back to HITL)
+            "ticket_number": "INC0001012",
+            "short_description": "Blue screen error on workstation",
+            "description": "User workstation showing BSOD with error SYSTEM_SERVICE_EXCEPTION. "
+                           "Happens 2-3 times per day.",
+            "category": "Hardware", "priority": "P2", "sla_due": "2024-01-16 16:00:00",
         },
         {   # Step 4 — Access Grant, P2 -> HITL regardless of priority
             "ticket_number": "REQ-1002",
